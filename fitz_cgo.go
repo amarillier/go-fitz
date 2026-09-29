@@ -26,6 +26,45 @@ fz_document *open_document(fz_context *ctx, const char *filename) {
 	return doc;
 }
 
+// open_document_detect_repair is like open_document, but also reports
+// (via needed_repair) whether MuPDF had to repair the document's own
+// structure to open it at all — added for KrankyBearReader, which needs
+// to tell a user their file's cross-reference table was inconsistent
+// (invisible before this, since fz_open_document repairs silently) rather
+// than leaving them to wonder why an annotation isn't rendering.
+//
+// fz_start_throw_on_repair makes a repair that would otherwise happen
+// silently throw instead, so the first attempt below either succeeds
+// cleanly (no repair needed) or throws (one would be needed). Either way,
+// fz_end_throw_on_repair runs before a second, normal attempt — needed
+// once more if the first one threw, since throw-on-repair mode aborts
+// before actually repairing anything.
+fz_document *open_document_detect_repair(fz_context *ctx, const char *filename, int *needed_repair) {
+	fz_document *doc = NULL;
+	*needed_repair = 0;
+
+	fz_start_throw_on_repair(ctx);
+	fz_try(ctx) {
+		doc = fz_open_document(ctx, filename);
+	}
+	fz_catch(ctx) {
+		doc = NULL;
+	}
+	fz_end_throw_on_repair(ctx);
+
+	if (doc == NULL) {
+		*needed_repair = 1;
+		fz_try(ctx) {
+			doc = fz_open_document(ctx, filename);
+		}
+		fz_catch(ctx) {
+			return NULL;
+		}
+	}
+
+	return doc;
+}
+
 fz_document *open_document_with_stream(fz_context *ctx, const char *magic, fz_stream *stream) {
 	fz_document *doc;
 
@@ -102,6 +141,20 @@ type Document struct {
 	doc    *C.struct_fz_document
 	mtx    sync.Mutex
 	stream *C.fz_stream
+
+	// neededRepair is set by New — see NeededRepair.
+	neededRepair bool
+}
+
+// NeededRepair reports whether opening this document required MuPDF to
+// repair its cross-reference table (see open_document_detect_repair) —
+// added for KrankyBearReader, to let a caller warn a user their file's
+// own structure was inconsistent, something MuPDF otherwise handles
+// silently. Only meaningful for a Document opened via New; always false
+// for one opened via NewFromMemory/NewFromReader (those go through
+// open_document_with_stream, not this detection path).
+func (f *Document) NeededRepair() bool {
+	return f.neededRepair
 }
 
 // New returns new fitz document.
@@ -129,11 +182,13 @@ func New(filename string) (f *Document, err error) {
 	cfilename := C.CString(filename)
 	defer C.free(unsafe.Pointer(cfilename))
 
-	f.doc = C.open_document(f.ctx, cfilename)
+	var neededRepair C.int
+	f.doc = C.open_document_detect_repair(f.ctx, cfilename, &neededRepair)
 	if f.doc == nil {
 		err = ErrOpenDocument
 		return
 	}
+	f.neededRepair = neededRepair != 0
 
 	ret := C.fz_needs_password(f.ctx, f.doc)
 	v := int(ret) != 0
