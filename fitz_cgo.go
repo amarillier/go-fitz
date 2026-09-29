@@ -62,6 +62,27 @@ int run_page_contents(fz_context *ctx, fz_page *page, fz_device *dev, fz_matrix 
 
 	return 1;
 }
+
+// run_page runs a page's own content stream AND its annotations' real
+// appearance streams (fz_run_page = fz_run_page_contents + fz_run_page_annots
+// in one call, per MuPDF's own fitz/document.h) — added for KrankyBearReader,
+// which needs annotations (Stamp especially, whose appearance is arbitrary
+// vector art with no fixed geometry to hand-roll a draw routine from) painted
+// the same way a real PDF viewer paints them, not composited by hand
+// afterward. Deliberately not touching run_page_contents above: some callers
+// (e.g. this app's own annotation-overlay code, still used for
+// click-to-select and recoloring) want the content-only render and paint
+// their own overlays on top of it.
+int run_page(fz_context *ctx, fz_page *page, fz_device *dev, fz_matrix transform, fz_cookie *cookie) {
+	fz_try(ctx) {
+		fz_run_page(ctx, page, dev, transform, cookie);
+	}
+	fz_catch(ctx) {
+		return 0;
+	}
+
+	return 1;
+}
 */
 import "C"
 
@@ -194,6 +215,22 @@ func (f *Document) Image(pageNumber int) (*image.RGBA, error) {
 
 // ImageDPI returns image for given page number and DPI.
 func (f *Document) ImageDPI(pageNumber int, dpi float64) (*image.RGBA, error) {
+	return f.imageDPI(pageNumber, dpi, false)
+}
+
+// ImageWithAnnotsDPI is like ImageDPI, but also paints every annotation's
+// own real appearance (via fz_run_page, which runs both the page's content
+// stream and its annotations' appearance streams, instead of
+// fz_run_page_contents' content-only render — see run_page's own C-side
+// doc comment above). Added for KrankyBearReader: the only way to render
+// an annotation whose real appearance isn't a fixed, simple shape a caller
+// could reconstruct itself from geometry alone (e.g. a Stamp annotation's
+// arbitrary freeform vector art).
+func (f *Document) ImageWithAnnotsDPI(pageNumber int, dpi float64) (*image.RGBA, error) {
+	return f.imageDPI(pageNumber, dpi, true)
+}
+
+func (f *Document) imageDPI(pageNumber int, dpi float64, withAnnots bool) (*image.RGBA, error) {
 	f.mtx.Lock()
 	defer f.mtx.Unlock()
 
@@ -231,7 +268,12 @@ func (f *Document) ImageDPI(pageNumber int, dpi float64) (*image.RGBA, error) {
 	defer C.fz_drop_device(f.ctx, device)
 
 	drawMatrix := C.fz_identity
-	ret := C.run_page_contents(f.ctx, page, device, drawMatrix, nil)
+	var ret C.int
+	if withAnnots {
+		ret = C.run_page(f.ctx, page, device, drawMatrix, nil)
+	} else {
+		ret = C.run_page_contents(f.ctx, page, device, drawMatrix, nil)
+	}
 	if ret == 0 {
 		return nil, ErrRunPageContents
 	}
