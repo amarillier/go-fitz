@@ -83,6 +83,114 @@ int run_page(fz_context *ctx, fz_page *page, fz_device *dev, fz_matrix transform
 
 	return 1;
 }
+
+// kbr_stext_char is one entry of stext_chars' flat output: a character (or a
+// '\n' pseudo-entry mirroring the newlines fz_print_stext_page_as_text emits,
+// so entry i lines up with rune i of Document.Text's string).
+typedef struct {
+	int c;
+	int line;
+	float quad[8]; // ul.x ul.y ur.x ur.y ll.x ll.y lr.x lr.y
+	float size;
+} kbr_stext_char;
+
+// stext_chars extracts a page's characters with their exact quads — added
+// for KrankyBearReader's text-snapped highlights and exact search boxes,
+// which need per-character positions Document.Text and Document.HTML (line
+// level only) don't expose. Runs the page's content only (like Text) with
+// default options, then walks blocks/lines/chars, appending a '\n' entry
+// after every line and one more after every text block — the same layout
+// fz_print_stext_page_as_text writes. Returns the entry count and a malloc'd
+// array in *out (release with stext_free), or -1 on error.
+int stext_chars(fz_context *ctx, fz_page *page, kbr_stext_char **out) {
+	fz_stext_page *text = NULL;
+	fz_device *dev = NULL;
+	kbr_stext_char *arr = NULL;
+	int n = 0, cap = 0, line_no = 0;
+	fz_stext_options opts;
+	fz_cookie cookie;
+
+	memset(&opts, 0, sizeof(opts));
+	memset(&cookie, 0, sizeof(cookie));
+	fz_var(text);
+	fz_var(dev);
+	fz_var(arr);
+	fz_var(n);
+	fz_var(cap);
+	fz_var(line_no);
+
+	fz_try(ctx) {
+		fz_stext_block *b;
+		fz_stext_line *l;
+		fz_stext_char *ch;
+
+		text = fz_new_stext_page(ctx, fz_bound_page(ctx, page));
+		dev = fz_new_stext_device(ctx, text, &opts);
+		fz_run_page_contents(ctx, page, dev, fz_identity, &cookie);
+		fz_close_device(ctx, dev);
+
+		for (b = text->first_block; b; b = b->next) {
+			if (b->type != FZ_STEXT_BLOCK_TEXT)
+				continue;
+			for (l = b->u.t.first_line; l; l = l->next) {
+				for (ch = l->first_char; ch; ch = ch->next) {
+					if (n == cap) {
+						cap = cap ? cap * 2 : 256;
+						arr = realloc(arr, cap * sizeof(kbr_stext_char));
+						if (!arr)
+							fz_throw(ctx, FZ_ERROR_GENERIC, "out of memory");
+					}
+					arr[n].c = ch->c;
+					arr[n].line = line_no;
+					arr[n].quad[0] = ch->quad.ul.x; arr[n].quad[1] = ch->quad.ul.y;
+					arr[n].quad[2] = ch->quad.ur.x; arr[n].quad[3] = ch->quad.ur.y;
+					arr[n].quad[4] = ch->quad.ll.x; arr[n].quad[5] = ch->quad.ll.y;
+					arr[n].quad[6] = ch->quad.lr.x; arr[n].quad[7] = ch->quad.lr.y;
+					arr[n].size = ch->size;
+					n++;
+				}
+				// the '\n' ending this line (zero quad)
+				if (n == cap) {
+					cap = cap ? cap * 2 : 256;
+					arr = realloc(arr, cap * sizeof(kbr_stext_char));
+					if (!arr)
+						fz_throw(ctx, FZ_ERROR_GENERIC, "out of memory");
+				}
+				memset(&arr[n], 0, sizeof(kbr_stext_char));
+				arr[n].c = '\n';
+				arr[n].line = line_no;
+				n++;
+				line_no++;
+			}
+			// the blank line fz_print_stext_page_as_text writes after a block
+			if (n == cap) {
+				cap = cap ? cap * 2 : 256;
+				arr = realloc(arr, cap * sizeof(kbr_stext_char));
+				if (!arr)
+					fz_throw(ctx, FZ_ERROR_GENERIC, "out of memory");
+			}
+			memset(&arr[n], 0, sizeof(kbr_stext_char));
+			arr[n].c = '\n';
+			arr[n].line = line_no - 1;
+			n++;
+		}
+	}
+	fz_always(ctx) {
+		fz_drop_device(ctx, dev);
+		fz_drop_stext_page(ctx, text);
+	}
+	fz_catch(ctx) {
+		free(arr);
+		return -1;
+	}
+
+	*out = arr;
+	return n;
+}
+
+void stext_free(kbr_stext_char *p) {
+	free(p);
+}
 */
 import "C"
 
@@ -638,4 +746,62 @@ func (f *Document) Close() error {
 	f.data = nil
 
 	return nil
+}
+
+// TextChar is one character of a page's text with its exact position, as
+// returned by TextChars.
+type TextChar struct {
+	// R is the character; '\n' marks a line or block break (such entries
+	// have a zero Quad), so the R values of TextChars concatenate to exactly
+	// what Text returns for the same page.
+	R rune
+	// Quad is the character's corners in page points, origin top-left, y
+	// down (MuPDF's page space): upper-left, upper-right, lower-left,
+	// lower-right as x,y pairs.
+	Quad [8]float32
+	// Size is the font size in points.
+	Size float32
+	// Line is a page-wide line number, shared by every character on a line.
+	Line int
+}
+
+// TextChars returns every character on page pageNumber (0-based) with its
+// exact quad — see TextChar. Added for KrankyBearReader: text-snapped
+// highlight drawing and an exact search-match box both need per-character
+// positions that Text (no positions) and HTML (line level) don't carry.
+func (f *Document) TextChars(pageNumber int) ([]TextChar, error) {
+	f.mtx.Lock()
+	defer f.mtx.Unlock()
+
+	if pageNumber >= f.NumPage() {
+		return nil, ErrPageMissing
+	}
+
+	page := C.load_page(f.ctx, f.doc, C.int(pageNumber))
+	if page == nil {
+		return nil, ErrLoadPage
+	}
+	defer C.fz_drop_page(f.ctx, page)
+
+	var raw *C.kbr_stext_char
+	n := int(C.stext_chars(f.ctx, page, &raw))
+	if n < 0 {
+		return nil, ErrRunPageContents
+	}
+	if n == 0 {
+		return nil, nil
+	}
+	defer C.stext_free(raw)
+
+	src := unsafe.Slice(raw, n)
+	out := make([]TextChar, n)
+	for i := range src {
+		out[i].R = rune(src[i].c)
+		out[i].Size = float32(src[i].size)
+		out[i].Line = int(src[i].line)
+		for j := 0; j < 8; j++ {
+			out[i].Quad[j] = float32(src[i].quad[j])
+		}
+	}
+	return out, nil
 }
